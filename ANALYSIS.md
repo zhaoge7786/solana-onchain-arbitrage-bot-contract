@@ -372,3 +372,155 @@ let fee = profit.div_ceil(10);  // 10% 利润抽成，向上取整
 - CLMM/DLMM 可支持跨 tick/bin 套利
 - 可引入更多 DEX (如 Orca Whirlpool、Jupiter等)
 - 账户验证可以加强 (owner check)
+
+---
+
+## 十一、与 solana-onchain-arbitrage-bot (Repo B) 对比分析
+
+### 基本信息对比
+
+| 维度 | 本仓库 (Repo A: arb_touyi) | Repo B (second_anchor / zooey_go) |
+|------|---------------------------|-----------------------------------|
+| **合约名** | `arb_touyi` | `second_anchor` / `zooey_go` |
+| **Program ID** | `DxeQQ7PQ94j26ism5ivTqNHAkteFNmgRpqYx7XQFqs9Z` | `11111111111111111111111111111111` (未部署) |
+| **Anchor 版本** | 0.30.1 | 0.31.1 (更新) |
+| **代码量** | ~6,346 行 Rust | ~22,662 行 Rust (3.6倍) |
+| **DEX 数量** | 6 种 | 7 种 (多 Orca Whirlpool + Meteora DAMM V2) |
+| **路径** | 仅 2-hop (A→B→A) | 2-hop + **3-hop** (A→B→C→A) |
+| **利润抽成** | 10% 硬编码 | **无抽成** |
+| **部署状态** | 已部署 mainnet | 未部署 (program ID 全1) |
+
+### 架构设计对比
+
+| 维度 | Repo A (arb_touyi) | Repo B (zooey_go) |
+|------|-------------------|-------------------|
+| **账户传入方式** | 固定 `Option<UncheckedAccount>` 数组 (32/64个) | `remaining_accounts` 动态解析 |
+| **市场抽象** | `BaseMarketPool` trait + `CreateMarket` trait | `ParsedPoolState` enum + 独立 `dex/` + `swap/` 模块 |
+| **方向处理** | `MockReverseMarketPool` 装饰器模式 | 每个 DEX swap 函数内部 `is_buy` 参数控制 |
+| **数学精度** | **f64 浮点数** (链上！) | **Q64.64 定点数** (u128) |
+| **最优金额计算** | 9种组合的解析解 (closed-form) | **黄金分割法** 数值搜索 (`find_optimal_wsol_amount_golden_section`) |
+| **价格比较** | 隐式 (在 arb_calc 中) | 显式 Q64.64 价格比率 + 利润因子计算 |
+| **DEX识别** | `market_type[]` 字节数组 (off-chain编码) | 自动识别 program_id → pool_type |
+| **模拟模式** | 无 (debug-out feature flag) | `is_simulate` 参数，支持链上模拟不执行 |
+| **Token-2022** | 部分支持 (仅 Raydium CPMM) | **全面支持** (transfer fee 计算, token program 识别) |
+| **内存管理** | 无特殊处理 | 显式 Box 堆分配 + 用后即 None 释放 |
+
+### 支持的 DEX 对比
+
+| DEX | Repo A | Repo B |
+|-----|--------|--------|
+| Raydium AMM (Legacy) | ✅ | ✅ |
+| Raydium CPMM | ✅ | ✅ |
+| Raydium CLMM | ✅ | ✅ |
+| Meteora DLMM | ✅ | ✅ |
+| Meteora AMM (Vault) | ✅ | ❌ |
+| **Meteora DAMM V2** | ❌ | ✅ |
+| PumpSwap | ✅ | ✅ |
+| **Orca Whirlpool** | ❌ | ✅ |
+
+### 各维度优劣判定
+
+#### 1. 数学精度: Repo B 胜
+
+| | Repo A | Repo B |
+|--|--------|--------|
+| 表示 | f64 浮点数 | Q64.64 定点数 (u128) |
+| 精度 | ~15位有效数字，有舍入误差 | 精确整数运算，无浮点误差 |
+| 溢出保护 | 依赖 f64 范围 | checked_sub / safe_mul_div_cast |
+
+Repo A 在链上使用 f64 是**高风险选择** — 浮点运算在不同硬件上可能产生不同结果，且舍入累积可能导致套利金额偏差。Repo B 全程使用 Q64.64 定点数是行业最佳实践。
+
+#### 2. 最优金额计算: 各有优劣
+
+| | Repo A | Repo B |
+|--|--------|--------|
+| 方法 | 解析解 (closed-form) | 黄金分割法搜索 |
+| CU 消耗 | 低 (单次计算) | 较高 (多次迭代) |
+| 准确度 | 受 f64 精度限制 | 更精确 (实际模拟 swap 过程) |
+| 覆盖度 | 9种市场组合都有公式 | 通用 (任意 DEX 组合自动适配) |
+
+Repo A 的解析解在 CU 效率上更优，但因使用 f64 实际精度可能反而不如 Repo B 的数值搜索。Repo B 的黄金分割法更**通用**——增加新 DEX 不需要推导新公式。
+
+#### 3. 路径支持: Repo B 胜
+
+Repo B 支持 **3-hop 路径** (WSOL→Token1→Token2→WSOL)，这意味着能捕获三角套利机会。这是显著优势——很多套利机会只存在于三角路径中，2-hop 找不到。
+
+#### 4. 账户模型: Repo B 胜
+
+| | Repo A | Repo B |
+|--|--------|--------|
+| 方式 | 固定 Option 数组 | remaining_accounts 动态 |
+| 灵活性 | 受 32/64 上限限制 | 无硬上限 |
+| DEX 识别 | off-chain 编码 market_type | **自动识别** program_id |
+| 扩展性 | 新增 DEX 需改 input_model | 新增 DEX 只需加 parse 逻辑 |
+
+Repo B 通过 `remaining_accounts` + 自动 program_id 识别的方式更灵活优雅。Repo A 的固定数组方式虽然更简单直接，但扩展性差。
+
+#### 5. 代码工程质量: Repo B 胜
+
+| | Repo A | Repo B |
+|--|--------|--------|
+| 关注点分离 | market 中混合 dex 解析 + swap | dex/ (解析) 与 swap/ (执行) 完全分离 |
+| 内存管理 | 无显式管理 | Box 堆分配 + 及时释放 + 栈优化注释 |
+| 错误类型 | 5 种 | 25+ 种，覆盖更全 |
+| Token-2022 | 部分 | 完整 (transfer fee 计算) |
+| 中文注释 | 少量 | 丰富的中文注释和文档 |
+
+#### 6. 实战部署: Repo A 胜
+
+| | Repo A | Repo B |
+|--|--------|--------|
+| Program ID | 真实已部署 | 全 1 (占位) |
+| 抽成机制 | 有 (可运营) | 无 |
+| 稳定性 | 经过 mainnet 实战 | 未知 |
+| 代码精简度 | 6K 行，简洁 | 22K 行，有冗余 |
+
+Repo A 是**经过 mainnet 验证的生产代码**，这一点非常重要。Repo B 虽然功能更丰富，但 Program ID 为全 1 说明从未部署。
+
+#### 7. 抽象设计: Repo A 更优雅
+
+Repo A 的 `BaseMarketPool` trait + `MockReverseMarketPool` 装饰器是非常优雅的 OOP 设计:
+- 新增 DEX 只需实现 trait
+- 方向翻转通过装饰器自动处理
+- 套利引擎完全与 DEX 解耦
+
+Repo B 使用 enum 匹配，每增加一个 DEX 需要在 comparison.rs / optimalamt.rs / swap.rs 等多处添加 match arm，耦合度更高。
+
+### 综合评分
+
+| 维度 | Repo A | Repo B | 说明 |
+|------|--------|--------|------|
+| 数学精度 | 6/10 | **9/10** | Q64.64 vs f64 |
+| 路径丰富度 | 5/10 | **9/10** | 2-hop vs 2+3-hop |
+| DEX 覆盖度 | 7/10 | **8/10** | 6 vs 7，且 Whirlpool 重要 |
+| 抽象设计 | **9/10** | 7/10 | Trait 优于 enum 大量 match |
+| 代码精简度 | **9/10** | 6/10 | 6K vs 22K，信息密度高 |
+| CU 效率 | **8/10** | 6/10 | 解析解 vs 迭代搜索 |
+| 扩展性 | 6/10 | **8/10** | remaining_accounts 更灵活 |
+| Token-2022 | 4/10 | **9/10** | 全面 vs 部分 |
+| 实战验证 | **10/10** | 3/10 | 已部署 vs 未部署 |
+| 内存安全 | 5/10 | **8/10** | 无管理 vs 显式 Box |
+| **总计** | **69/100** | **73/100** | |
+
+### 结论
+
+**Repo B (zooey_go) 在技术完整度上更优秀**：
+- Q64.64 定点数精度更高
+- 3-hop 路径覆盖更多套利机会
+- 7 种 DEX (含 Orca Whirlpool) 覆盖更广
+- Token-2022 全面支持
+- 内存管理更专业
+
+**Repo A (arb_touyi) 在工程效率和实战上更优秀**：
+- 代码量仅 1/3.6，但实现了核心功能
+- 解析解套利计算，CU 效率更高
+- Trait 抽象设计更优雅
+- **已在 mainnet 实战验证**——这是最重要的
+
+**如果要做一个最优方案**，应该取二者之长：
+1. 用 Repo A 的 trait 抽象架构
+2. 用 Repo B 的 Q64.64 定点数精度
+3. 用 Repo B 的 remaining_accounts 灵活账户传入
+4. 用 Repo B 的 3-hop 路径支持
+5. 保留 Repo A 的解析解 (CU 优势) 但用定点数重写
+6. 加入 Repo B 的 Orca Whirlpool 和 Token-2022 全面支持
